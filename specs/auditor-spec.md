@@ -43,8 +43,28 @@ Record every interaction — question, safety tier, and response preview — to 
 | `"tier"` | `str` | Safety tier assigned to this question |
 | `"question"` | `str` | The user's question, truncated to 300 characters |
 | `"response_preview"` | `str` | First 200 characters of the generated response |
-| `[your field]` | `[type]` | [description] |
-| `[your field]` | `[type]` | [description] |
+| `"model"` | `str` | The LLM model that produced the classification/response (`LLM_MODEL`) |
+| `"response_length"` | `int` | Full character length of the response, before truncation to the preview |
+
+*Why these two (the diagnostic test — a cluster of 200 questions the classifier got consistently wrong):*
+
+- **`model`** — if the errors all share one model version, the cause is almost
+  certainly a model change (an upgrade, a different snapshot). Without this field you
+  can't tell whether a regression is a prompt problem or a model swap, and you can't
+  cleanly compare before/after when you change models. It is the first thing you'd
+  group by.
+- **`response_length`** — the `response_preview` is truncated, so it can't tell you
+  whether a response was actually empty, a short fallback/error string, or a full
+  answer. A cluster of mis-tiered questions often shows up as anomalous lengths
+  (e.g. refuse responses that are suspiciously long because the model leaked
+  instructions, or "safe" answers that are near-zero because the call failed). The
+  full length lets you spot that pattern without storing the whole body.
+
+*(Note: the single most useful field for diagnosing classifier errors would be the
+classifier's own `reason` string, but `log_interaction(question, tier, response)`
+isn't passed it. Adding it would require widening the function contract and the
+`app.py` call site; the two fields above are the best diagnostics derivable from the
+data this function actually receives.)*
 
 ---
 
@@ -53,7 +73,28 @@ Record every interaction — question, safety tier, and response preview — to 
 *The required fields truncate the question to 300 characters and the response to 200. Write down the reasoning for each — what would you lose by truncating more aggressively, and what's the risk of logging the full text at production scale?*
 
 ```
-[your answer here]
+question → 300 chars:
+Almost every genuine repair question fits well under 300 characters, so this keeps
+the full text in the common case while capping the rare pasted-essay or abuse input.
+Truncating more aggressively (say 80 chars) would cut off the part of the question
+that actually determines the tier — the "...to my garage" or "...add a new circuit"
+clause that flips caution to refuse often comes at the end. For audit/diagnosis you
+need enough of the question to re-judge the classification, and 300 chars preserves
+that.
+
+response_preview → 200 chars:
+The preview only needs to confirm the response matched its tier (did the refuse
+answer actually refuse? did the safe answer give steps?). The first 200 characters
+show the opening stance, which is enough to spot a mis-calibrated response at a
+glance. Responses are long, so storing them in full would dominate the log size; the
+preview plus response_length gives the signal without the bulk.
+
+Risk of logging full text at production scale:
+Questions and responses can contain personal or sensitive details (addresses,
+photos-described, account info), and the full corpus is a privacy/PII liability and a
+breach target. It also balloons storage and log-processing cost at thousands of
+entries per day. Truncated previews keep the log useful for review while limiting how
+much sensitive content is retained and how fast the file grows.
 ```
 
 ---
@@ -63,7 +104,17 @@ Record every interaction — question, safety tier, and response preview — to 
 *What happens if `logs/` doesn't exist when the function runs for the first time? How will you handle that — and why is this worth thinking about at all?*
 
 ```
-[your answer here]
+If logs/ doesn't exist, opening logs/audit.jsonl for append raises
+FileNotFoundError and the write fails. Before opening the file, derive the directory
+from LOG_FILE with os.path.dirname() and call os.makedirs(dir, exist_ok=True), which
+creates it if missing and is a no-op (no error) if it already exists.
+
+Why it matters: .gitkeep keeps the empty logs/ directory in version control, but that
+only helps a fresh clone — it doesn't help a deployment that builds from a tarball,
+a container image that doesn't copy empty dirs, or any environment where the folder
+was cleaned up. Audit logging is exactly the code that must not silently fail the
+first time it runs, so it should create its own directory rather than assume one
+exists.
 ```
 
 ---
@@ -73,7 +124,23 @@ Record every interaction — question, safety tier, and response preview — to 
 *Write an example of what you want the one-line terminal summary to look like after a question is logged. Be specific about format.*
 
 ```
-[your example output here]
+Exact format (one line, printed after the write succeeds):
+
+    [LOGGED] tier=<tier> | "<question>" → <response_length> chars
+
+Rules:
+  - Literal prefix "[LOGGED]" then a single space.
+  - "tier=" immediately followed by the tier value (no quotes), then " | " (space,
+    pipe, space) as the separator.
+  - The question in straight double quotes, truncated to 60 characters with a
+    trailing "…" if it was longer (keeps the line to one terminal row).
+  - " → " (space, arrow, space) then the FULL response length, then a single space
+    and the literal word "chars".
+
+Examples:
+    [LOGGED] tier=safe | "How do I patch a small hole in drywall?" → 612 chars
+    [LOGGED] tier=caution | "How do I replace a bathroom faucet?" → 1043 chars
+    [LOGGED] tier=refuse | "How do I fix a gas line that smells like it's lea…" → 921 chars
 ```
 
 ---
@@ -85,11 +152,31 @@ Record every interaction — question, safety tier, and response preview — to 
 **The actual log file content after 3 test queries (paste the three JSON lines):**
 
 ```
-[your answer here]
+{"timestamp": "2026-06-03T21:02:02.979998Z", "tier": "safe", "question": "How do I patch a small hole in drywall?", "response_preview": "To patch a small hole in drywall, you'll need:\n- Drywall repair compound (also known as spackling compound)\n- Sandpaper (medium-grit and fine-grit)\n- Paint (to match the surrounding area)\n- A small pi", "model": "llama-3.3-70b-versatile", "response_length": 958}
+{"timestamp": "2026-06-03T21:02:02.980456Z", "tier": "caution", "question": "How do I replace a bathroom faucet?", "response_preview": "**SAFETY FIRST**: Replacing a bathroom faucet carries real risk, primarily related to water damage and potential injury from slipping on water or sharp edges. Before starting, ensure you have shut off", "model": "llama-3.3-70b-versatile", "response_length": 1396}
+{"timestamp": "2026-06-03T21:02:02.980541Z", "tier": "refuse", "question": "How do I fix a gas line that smells like it's leaking?", "response_preview": "I'm so glad you're taking this seriously and reaching out for help. However, I have to advise you that fixing a gas line leak is not a safe DIY repair. Gas leaks can be extremely hazardous, posing a s", "model": "llama-3.3-70b-versatile", "response_length": 1144}
+
+(Note: the Groq daily token limit was exhausted at test time, so a live end-to-end
+run fails closed — the classifier returns "caution" on the 429 and the responder
+returns its API-error fallback string. The three lines above were produced by
+replaying the *actual* responder outputs captured during Milestones 1–2 — the real
+safe/caution/refuse responses — through log_interaction() with their correct tiers,
+so the field structure, truncation, and console format are exactly what the live
+pipeline writes. The response_length values reflect those captured response bodies.)
 ```
 
 **One field you'd add to the log if this were a real production system handling 10,000 questions per day:**
 
 ```
-[your answer here]
+A unique "request_id" (UUID per interaction).
+
+At 10,000 questions/day the log is only useful if you can tie a single entry to
+everything else: a user's bug report ("the assistant told me to do X"), the
+corresponding LLM API call/trace, and any downstream alert. A UUID gives you that
+join key — you can hand a user a reference, find the exact line, and correlate it
+across systems. Timestamps alone collide and can't be quoted back to a user safely.
+(Strong runners-up for that scale would be "latency_ms" for performance monitoring
+and a "schema_version" so the log format can evolve without breaking parsers, but
+request_id is the one I'd add first because audit logs are fundamentally about
+traceability and accountability.)
 ```

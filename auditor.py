@@ -1,7 +1,11 @@
 import json
 import os
 from datetime import datetime
-from config import LOG_FILE
+from config import LOG_FILE, LLM_MODEL
+
+QUESTION_LIMIT = 300
+PREVIEW_LIMIT = 200
+CONSOLE_QUESTION_LIMIT = 60
 
 
 def log_interaction(question: str, tier: str, response: str) -> None:
@@ -31,4 +35,26 @@ def log_interaction(question: str, tier: str, response: str) -> None:
 
     Design your log entry in specs/auditor-spec.md before implementing here.
     """
-    pass
+    record = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "tier": tier,
+        "question": question[:QUESTION_LIMIT],
+        "response_preview": response[:PREVIEW_LIMIT],
+        "model": LLM_MODEL,
+        "response_length": len(response),
+    }
+
+    # Create logs/ if it doesn't exist; no-op if it already does.
+    log_dir = os.path.dirname(LOG_FILE)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    # One JSON object per line (.jsonl) — no indent, no pretty-printing.
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record) + "\n")
+
+    # One-line terminal summary.
+    console_question = question[:CONSOLE_QUESTION_LIMIT]
+    if len(question) > CONSOLE_QUESTION_LIMIT:
+        console_question += "…"
+    print(f'[LOGGED] tier={tier} | "{console_question}" → {len(response)} chars')
